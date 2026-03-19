@@ -13,6 +13,7 @@ from sqlalchemy import and_, select
 from src.config import get_config
 from src.core.backtest_engine import OVERALL_SENTINEL_CODE, BacktestEngine, EvaluationConfig
 from src.repositories.backtest_repo import BacktestRepository
+from src.repositories.stock_repo import StockRepository
 from src.storage import BacktestResult, BacktestSummary, DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class BacktestService:
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.db = db_manager or DatabaseManager.get_instance()
         self.repo = BacktestRepository(self.db)
+        self.stock_repo = StockRepository(self.db)
 
     def run_backtest(
         self,
@@ -87,11 +89,11 @@ class BacktestService:
                         )
                     )
                     continue
-                start_daily = self.repo.get_start_daily(code=analysis.code, analysis_date=analysis_date)
+                start_daily = self.stock_repo.get_start_daily(code=analysis.code, analysis_date=analysis_date)
 
                 if start_daily is None or start_daily.close is None:
                     self._try_fill_daily_data(code=analysis.code, analysis_date=analysis_date, eval_window_days=eval_window_days)
-                    start_daily = self.repo.get_start_daily(code=analysis.code, analysis_date=analysis_date)
+                    start_daily = self.stock_repo.get_start_daily(code=analysis.code, analysis_date=analysis_date)
 
                 if start_daily is None or start_daily.close is None:
                     insufficient += 1
@@ -109,7 +111,7 @@ class BacktestService:
                     )
                     continue
 
-                forward_bars = self.repo.get_forward_bars(
+                forward_bars = self.stock_repo.get_forward_bars(
                     code=analysis.code,
                     analysis_date=start_daily.date,
                     eval_window_days=int(eval_window_days),
@@ -117,7 +119,7 @@ class BacktestService:
 
                 if len(forward_bars) < int(eval_window_days):
                     self._try_fill_daily_data(code=analysis.code, analysis_date=start_daily.date, eval_window_days=eval_window_days)
-                    forward_bars = self.repo.get_forward_bars(
+                    forward_bars = self.stock_repo.get_forward_bars(
                         code=analysis.code,
                         analysis_date=start_daily.date,
                         eval_window_days=int(eval_window_days),
@@ -209,15 +211,14 @@ class BacktestService:
             "errors": errors,
         }
 
-    def get_recent_evaluations(self, *, code: Optional[str], limit: int = 50, page: int = 1) -> Dict[str, Any]:
+    def get_recent_evaluations(self, *, code: Optional[str], eval_window_days: Optional[int] = None, limit: int = 50, page: int = 1) -> Dict[str, Any]:
         offset = max(page - 1, 0) * limit
-        rows, total = self.repo.get_results_paginated(code=code, days=None, offset=offset, limit=limit)
+        rows, total = self.repo.get_results_paginated(code=code, eval_window_days=eval_window_days, days=None, offset=offset, limit=limit)
         items = [self._result_to_dict(r) for r in rows]
         return {"total": total, "page": page, "limit": limit, "items": items}
 
-    def get_summary(self, *, scope: str, code: Optional[str]) -> Optional[Dict[str, Any]]:
+    def get_summary(self, *, scope: str, code: Optional[str], eval_window_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
         config = get_config()
-        eval_window_days = int(getattr(config, "backtest_eval_window_days", 10))
         engine_version = str(getattr(config, "backtest_engine_version", "v1"))
         lookup_code = OVERALL_SENTINEL_CODE if scope == "overall" else code
         summary = self.repo.get_summary(
@@ -229,6 +230,34 @@ class BacktestService:
         if summary is None:
             return None
         return self._summary_to_dict(summary)
+
+    def get_global_summary(self, *, eval_window_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Return overall backtest metrics normalized for Agent memory consumers."""
+        return self._normalize_learning_summary(
+            self.get_summary(scope="overall", code=None, eval_window_days=eval_window_days)
+        )
+
+    def get_stock_summary(self, code: str, *, eval_window_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Return per-stock backtest metrics normalized for Agent memory consumers."""
+        return self._normalize_learning_summary(
+            self.get_summary(scope="stock", code=code, eval_window_days=eval_window_days)
+        )
+
+    def get_strategy_summary(self, strategy_id: str, *, eval_window_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Return strategy-like summary metrics for Agent memory consumers.
+
+        The current backtest storage layer only persists overall / per-stock rollups.
+        Until strategy-tagged backtest summaries are available, use the overall rollup
+        so memory and calibration features can still consume real historical metrics.
+        """
+        summary = self.get_global_summary(eval_window_days=eval_window_days)
+        if summary is None:
+            return None
+
+        normalized = dict(summary)
+        normalized["strategy_id"] = strategy_id
+        normalized["source_scope"] = summary.get("scope", "overall")
+        return normalized
 
     def _resolve_analysis_date(self, analysis) -> Optional[date]:
         parsed = self.repo.parse_analysis_date_from_snapshot(analysis.context_snapshot)
@@ -389,3 +418,29 @@ class BacktestService:
             "advice_breakdown": json.loads(row.advice_breakdown_json) if row.advice_breakdown_json else {},
             "diagnostics": json.loads(row.diagnostics_json) if row.diagnostics_json else {},
         }
+
+    @staticmethod
+    def _normalize_learning_summary(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Normalize summary metrics to the ratio-based shape expected by Agent memory."""
+        if summary is None:
+            return None
+
+        normalized = dict(summary)
+        normalized["win_rate"] = BacktestService._pct_to_ratio(summary.get("win_rate_pct"), default=0.5)
+        normalized["direction_accuracy"] = BacktestService._pct_to_ratio(
+            summary.get("direction_accuracy_pct"),
+            default=0.5,
+        )
+
+        avg_return_pct = summary.get("avg_simulated_return_pct")
+        if avg_return_pct is None:
+            avg_return_pct = summary.get("avg_stock_return_pct")
+        normalized["avg_return"] = BacktestService._pct_to_ratio(avg_return_pct, default=0.0)
+        return normalized
+
+    @staticmethod
+    def _pct_to_ratio(value: Optional[float], default: float = 0.0) -> float:
+        try:
+            return float(value) / 100.0
+        except (TypeError, ValueError):
+            return default
